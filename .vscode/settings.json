@@ -10,5 +10,7 @@
         "/usr/local/lib/python3/dist-packages",
         "/home/barat/.local/lib/python3.8/site-packages"
     ],
-    "github.copilot.chat.codeGeneration.useInstructionFiles": true
+    "github.copilot.chat.codeGeneration.useInstructionFiles": true,
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
 }
