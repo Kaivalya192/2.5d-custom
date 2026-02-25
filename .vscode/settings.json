@@ -1,0 +1,14 @@
+{
+    "ROS2.distro": "noetic",
+    "python.autoComplete.extraPaths": [
+        "/opt/ros/noetic/lib/python3/dist-packages",
+        "/usr/local/lib/python3/dist-packages",
+        "/home/barat/.local/lib/python3.8/site-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/opt/ros/noetic/lib/python3/dist-packages",
+        "/usr/local/lib/python3/dist-packages",
+        "/home/barat/.local/lib/python3.8/site-packages"
+    ],
+    "github.copilot.chat.codeGeneration.useInstructionFiles": true
+}
