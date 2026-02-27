@@ -65,13 +65,60 @@ def load_roi_yaml(path: str, img_w: int, img_h: int) -> Tuple[int, int, int, int
     return x0, y0, x1, y1
 
 
-def frame_source_realsense(width: int, height: int, fps: int) -> Generator[np.ndarray, None, None]:
+def _configure_realsense_color_sensor(
+    profile,
+    exposure: float,
+    gain: float,
+    white_balance: float,
+    disable_auto_exposure: bool,
+    disable_auto_wb: bool,
+) -> None:
+    dev = profile.get_device()
+    sensors = dev.query_sensors()
+    color_sensor = None
+    for s in sensors:
+        name = s.get_info(rs.camera_info.name).lower()
+        if "rgb" in name or "color" in name:
+            color_sensor = s
+            break
+    if color_sensor is None:
+        return
+    if disable_auto_exposure and color_sensor.supports(rs.option.enable_auto_exposure):
+        color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+    if color_sensor.supports(rs.option.exposure):
+        color_sensor.set_option(rs.option.exposure, float(exposure))
+    if color_sensor.supports(rs.option.gain):
+        color_sensor.set_option(rs.option.gain, float(gain))
+    if disable_auto_wb and color_sensor.supports(rs.option.enable_auto_white_balance):
+        color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
+    if color_sensor.supports(rs.option.white_balance):
+        color_sensor.set_option(rs.option.white_balance, float(white_balance))
+
+
+def frame_source_realsense(
+    width: int,
+    height: int,
+    fps: int,
+    exposure: float,
+    gain: float,
+    white_balance: float,
+    disable_auto_exposure: bool,
+    disable_auto_wb: bool,
+) -> Generator[np.ndarray, None, None]:
     if rs is None:
         raise RuntimeError("pyrealsense2 is not available in this environment.")
     pipe = rs.pipeline()
     cfg = rs.config()
     cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-    pipe.start(cfg)
+    profile = pipe.start(cfg)
+    _configure_realsense_color_sensor(
+        profile,
+        exposure=exposure,
+        gain=gain,
+        white_balance=white_balance,
+        disable_auto_exposure=disable_auto_exposure,
+        disable_auto_wb=disable_auto_wb,
+    )
     try:
         for _ in range(15):
             _ = pipe.wait_for_frames(5000)
@@ -129,7 +176,16 @@ def run(args: argparse.Namespace) -> None:
     print(f"[Info] Model loaded: {args.model}")
 
     if args.source == "rs":
-        frames = frame_source_realsense(args.width, args.height, args.fps)
+        frames = frame_source_realsense(
+            args.width,
+            args.height,
+            args.fps,
+            args.exposure,
+            args.gain,
+            args.white_balance,
+            args.disable_auto_exposure,
+            args.disable_auto_wb,
+        )
     elif args.source == "webcam":
         frames = frame_source_webcam(args.webcam_index)
     elif args.source == "video":
@@ -221,6 +277,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--exposure", type=float, default=140.0)
+    parser.add_argument("--gain", type=float, default=16.0)
+    parser.add_argument("--white_balance", type=float, default=4500.0)
+    parser.add_argument("--disable_auto_exposure", action="store_true")
+    parser.add_argument("--disable_auto_wb", action="store_true")
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.45)
     parser.add_argument("--imgsz", type=int, default=640)
