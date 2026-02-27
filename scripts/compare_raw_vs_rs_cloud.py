@@ -87,8 +87,8 @@ def raw_cloud_in_rgb(
     use_wls, use_lr_check, lr_thresh,
     clahe, temporal_state, temporal_alpha,
     R_L_to_RGB, t_L_to_RGB,
-    Krgb, rgb_w, rgb_h,
     zmin, zmax,
+    Krgb=None, rgb_w=None, rgb_h=None,
     diag=None
 ):
     """
@@ -164,7 +164,7 @@ def raw_cloud_in_rgb(
 
     Z = pts_out[:, 2]
     good = np.isfinite(Z) & (Z >= zmin) & (Z <= zmax)
-    if np.any(good):
+    if np.any(good) and (Krgb is not None) and (rgb_w is not None) and (rgb_h is not None):
         pts_g = pts_out[good]
         zg = pts_g[:, 2]
         u = (Krgb[0, 0] * (pts_g[:, 0] / zg) + Krgb[0, 2])
@@ -172,6 +172,8 @@ def raw_cloud_in_rgb(
         ui = np.rint(u).astype(np.int32)
         vi = np.rint(v).astype(np.int32)
         inb = (ui >= 0) & (ui < int(rgb_w)) & (vi >= 0) & (vi < int(rgb_h))
+    elif np.any(good):
+        inb = np.ones((int(np.count_nonzero(good)),), dtype=bool)
     else:
         inb = np.zeros((0,), dtype=bool)
     if diag is not None:
@@ -303,6 +305,8 @@ def main():
     ap.add_argument("--point_size", type=float, default=4.0)
     ap.add_argument("--shift_raw_x", type=float, default=0.25)
     ap.add_argument("--diag", action="store_true", help="print RAW/RS stage drop diagnostics")
+    ap.add_argument("--raw_only", action="store_true",
+                    help="disable RGB/RS path and run only RAW stereo point cloud")
     ap.add_argument("--emitter", type=int, default=1, help="0=off, 1=on")
     ap.add_argument("--laser_power", type=float, default=None, help="optional projector power")
 
@@ -328,14 +332,16 @@ def main():
     cfg = rs.config()
     cfg.enable_stream(rs.stream.infrared, 1, args.ir_w, args.ir_h, rs.format.y8, args.ir_fps)
     cfg.enable_stream(rs.stream.infrared, 2, args.ir_w, args.ir_h, rs.format.y8, args.ir_fps)
-    cfg.enable_stream(rs.stream.depth, args.ir_w, args.ir_h, rs.format.z16, args.ir_fps)
-    cfg.enable_stream(rs.stream.color, args.w, args.h, rs.format.rgb8, args.fps)
+    if not args.raw_only:
+        cfg.enable_stream(rs.stream.depth, args.ir_w, args.ir_h, rs.format.z16, args.ir_fps)
+        cfg.enable_stream(rs.stream.color, args.w, args.h, rs.format.rgb8, args.fps)
     profile = pipe.start(cfg)
 
     dev = profile.get_device()
     depth_sensor = dev.first_depth_sensor()
-    depth_scale = float(depth_sensor.get_depth_scale())
-    print(f"[Info] depth_scale={depth_scale} m/unit")
+    depth_scale = float(depth_sensor.get_depth_scale()) if not args.raw_only else 0.0
+    if not args.raw_only:
+        print(f"[Info] depth_scale={depth_scale} m/unit")
     try:
         depth_sensor.set_option(rs.option.emitter_enabled, float(args.emitter))
     except Exception:
@@ -346,13 +352,15 @@ def main():
         except Exception as e:
             print(f"[WARN] laser_power not set: {e}")
 
-    align = rs.align(rs.stream.color)
+    align = rs.align(rs.stream.color) if not args.raw_only else None
 
-    color_sp = profile.get_stream(rs.stream.color).as_video_stream_profile()
-    intr = color_sp.get_intrinsics()
-    Krgb = np.array([[intr.fx, 0, intr.ppx],
-                     [0, intr.fy, intr.ppy],
-                     [0, 0, 1]], dtype=np.float64)
+    Krgb = None
+    if not args.raw_only:
+        color_sp = profile.get_stream(rs.stream.color).as_video_stream_profile()
+        intr = color_sp.get_intrinsics()
+        Krgb = np.array([[intr.fx, 0, intr.ppx],
+                         [0, intr.fy, intr.ppy],
+                         [0, 0, 1]], dtype=np.float64)
 
     # Raw stereo setup
     matcher = make_sgbm(args.num_disp, args.block)
@@ -381,7 +389,6 @@ def main():
 
     # Decide ordering once
     frames = pipe.wait_for_frames(5000)
-    _ = align.process(frames)
     ir1 = frames.get_infrared_frame(1)
     ir2 = frames.get_infrared_frame(2)
     ir1_raw = np.asanyarray(ir1.get_data())
@@ -411,18 +418,19 @@ def main():
     viz_first = True
     if args.viz:
         vis = o3d.visualization.Visualizer()
-        vis.create_window("RAW cloud vs RS cloud", 1280, 720, visible=True)
+        vis.create_window("RAW cloud only" if args.raw_only else "RAW cloud vs RS cloud", 1280, 720, visible=True)
         opt = vis.get_render_option()
         opt.point_size = float(args.point_size)
 
         axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=[0, 0, 0])
         vis.add_geometry(axis)
 
-        pcd_rs = o3d.geometry.PointCloud()
         pcd_raw = o3d.geometry.PointCloud()
-        pcd_rs.points = o3d.utility.Vector3dVector(np.array([[0, 0, 0]], dtype=np.float64))
         pcd_raw.points = o3d.utility.Vector3dVector(np.array([[0, 0, 0]], dtype=np.float64))
-        vis.add_geometry(pcd_rs)
+        if not args.raw_only:
+            pcd_rs = o3d.geometry.PointCloud()
+            pcd_rs.points = o3d.utility.Vector3dVector(np.array([[0, 0, 0]], dtype=np.float64))
+            vis.add_geometry(pcd_rs)
         vis.add_geometry(pcd_raw)
 
     # Metrics accumulators
@@ -452,7 +460,8 @@ def main():
     print(f"[Warmup] {args.warmup} frames ...")
     for _ in range(int(args.warmup)):
         fr = pipe.wait_for_frames(5000)
-        _ = align.process(fr)
+        if align is not None:
+            _ = align.process(fr)
 
     print(f"[Eval] {args.frames} frames in {zmin:.2f}..{zmax:.2f} m")
     t0 = time.time()
@@ -460,15 +469,16 @@ def main():
     try:
         for _ in range(int(args.frames)):
             fr = pipe.wait_for_frames(5000)
-            fr_a = align.process(fr)
-
-            depth = fr_a.get_depth_frame()
-            color = fr_a.get_color_frame()
-            if not depth or not color:
-                continue
-
-            # RS cloud in RGB frame
-            pts_rs = rs_cloud_in_rgb(depth, depth_scale, Krgb, zmin, zmax, diag=rs_diag)
+            if align is not None:
+                fr_a = align.process(fr)
+                depth = fr_a.get_depth_frame()
+                color = fr_a.get_color_frame()
+                if not depth or not color:
+                    continue
+                # RS cloud in RGB frame
+                pts_rs = rs_cloud_in_rgb(depth, depth_scale, Krgb, zmin, zmax, diag=rs_diag)
+            else:
+                pts_rs = np.zeros((0, 3), dtype=np.float32)
 
             # RAW cloud in RGB frame
             ir_left = get_left(fr)
@@ -479,30 +489,36 @@ def main():
                 use_wls, bool(args.lr_check), float(args.lr_thresh),
                 clahe, temporal_state, float(args.temporal_alpha),
                 R_L_to_RGB, t_L_to_RGB,
-                Krgb, args.w, args.h,
                 zmin, zmax,
+                Krgb, (args.w if Krgb is not None else None), (args.h if Krgb is not None else None),
                 diag=raw_diag
             )
 
-            dens_rs.append(float(pts_rs.shape[0]))
+            if not args.raw_only:
+                dens_rs.append(float(pts_rs.shape[0]))
             dens_raw.append(float(pts_raw.shape[0]))
 
-            voxel_z_noise_accumulate(rs_sum, rs_sumsq, rs_cnt, pts_rs, float(args.voxel))
+            if not args.raw_only:
+                voxel_z_noise_accumulate(rs_sum, rs_sumsq, rs_cnt, pts_rs, float(args.voxel))
             voxel_z_noise_accumulate(raw_sum, raw_sumsq, raw_cnt, pts_raw, float(args.voxel))
 
-            st = nn_distance_stats(pts_raw, pts_rs)
-            if st is not None:
-                nn_stats_list.append(st)
+            if not args.raw_only:
+                st = nn_distance_stats(pts_raw, pts_rs)
+                if st is not None:
+                    nn_stats_list.append(st)
 
             if vis is not None:
                 # shift RAW for side-by-side
                 pts_raw_v = pts_raw.copy()
-                pts_raw_v[:, 0] += float(args.shift_raw_x)
+                if not args.raw_only:
+                    pts_raw_v[:, 0] += float(args.shift_raw_x)
 
-                pcd_rs.points = o3d.utility.Vector3dVector(pts_rs.astype(np.float64))
+                if not args.raw_only and pcd_rs is not None:
+                    pcd_rs.points = o3d.utility.Vector3dVector(pts_rs.astype(np.float64))
                 pcd_raw.points = o3d.utility.Vector3dVector(pts_raw_v.astype(np.float64))
 
-                vis.update_geometry(pcd_rs)
+                if not args.raw_only and pcd_rs is not None:
+                    vis.update_geometry(pcd_rs)
                 vis.update_geometry(pcd_raw)
                 if viz_first and (pts_rs.shape[0] > 1000 or pts_raw.shape[0] > 1000):
                     vis.reset_view_point(True)
@@ -534,21 +550,25 @@ def main():
     else:
         med = p95 = rmse = mean = np.nan
 
-    print("\n================== CLOUD-TO-CLOUD REPORT ==================")
+    print("\n================== CLOUD REPORT ==================")
     print(f"Range: {zmin:.2f}..{zmax:.2f} m | frames: {len(dens_rs)} | elapsed: {dt:.2f}s")
-    print("\n[DENSITY] points per frame (higher is better)")
-    print(f"  RS  : {mean_rs:.0f} pts/frame")
-    print(f"  RAW : {mean_raw:.0f} pts/frame")
-
-    print("\n[NOISE] median voxel-Z std (m) (lower is better)")
-    print(f"  RS  : {noise_rs:.6f} m")
-    print(f"  RAW : {noise_raw:.6f} m")
-
-    print("\n[ACCURACY vs RS] NN distance RAW->RS (m) (lower is better)")
-    print(f"  median: {med:.6f} m")
-    print(f"  p95   : {p95:.6f} m")
-    print(f"  rmse  : {rmse:.6f} m")
-    print(f"  mean  : {mean:.6f} m")
+    if args.raw_only:
+        print("\n[DENSITY] RAW points per frame (higher is better)")
+        print(f"  RAW : {mean_raw:.0f} pts/frame")
+        print("\n[NOISE] RAW median voxel-Z std (m) (lower is better)")
+        print(f"  RAW : {noise_raw:.6f} m")
+    else:
+        print("\n[DENSITY] points per frame (higher is better)")
+        print(f"  RS  : {mean_rs:.0f} pts/frame")
+        print(f"  RAW : {mean_raw:.0f} pts/frame")
+        print("\n[NOISE] median voxel-Z std (m) (lower is better)")
+        print(f"  RS  : {noise_rs:.6f} m")
+        print(f"  RAW : {noise_raw:.6f} m")
+        print("\n[ACCURACY vs RS] NN distance RAW->RS (m) (lower is better)")
+        print(f"  median: {med:.6f} m")
+        print(f"  p95   : {p95:.6f} m")
+        print(f"  rmse  : {rmse:.6f} m")
+        print(f"  mean  : {mean:.6f} m")
     if args.diag and raw_diag is not None and rs_diag is not None:
         print("\n[DIAG] stage retention")
         if raw_diag["raw_total_px"] > 0:
@@ -559,10 +579,10 @@ def main():
         if raw_diag["frames"] > 0:
             print(f"  RAW z-range pts : {raw_diag['raw_zrange_pts'] / raw_diag['frames']:.0f} pts/frame")
             print(f"  RAW overlap pts : {raw_diag['raw_overlap_pts'] / raw_diag['frames']:.0f} pts/frame")
-        if rs_diag["rs_total_px"] > 0:
+        if (not args.raw_only) and rs_diag["rs_total_px"] > 0:
             rs_pct = 100.0 * rs_diag["rs_zrange_px"] / rs_diag["rs_total_px"]
             print(f"  RS z-range px   : {rs_pct:.1f}%")
-    print("===========================================================\n")
+    print("===================================================\n")
 
 
 if __name__ == "__main__":

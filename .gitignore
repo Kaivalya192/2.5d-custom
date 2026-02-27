@@ -1,1 +1,41 @@
 /.vscode
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+
+# Training outputs
+runs/
+outputs/
+checkpoints/
+weights/
+*.pt
+*.onnx
+*.engine
+
+# Dataset and generated data
+dataset/
+dataset_*/
+captured/
+overlays/
+labels.cache
+*.cache
+*.npy
+
+# Segmentation pipeline generated content
+segmentation_bgsub_yolo/captured/
+segmentation_bgsub_yolo/dataset/
+segmentation_bgsub_yolo/dataset_*/
+segmentation_bgsub_yolo/**/overlays/
+
+# Optional media artifacts
+*.mp4
+*.avi
+*.mkv
+*.mov
