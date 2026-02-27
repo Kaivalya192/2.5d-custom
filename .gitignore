@@ -20,10 +20,10 @@ weights/
 *.engine
 
 # Dataset and generated data
-dataset/
+
 dataset_*/
 captured/
-overlays/
+
 labels.cache
 *.cache
 *.npy
@@ -39,3 +39,7 @@ segmentation_bgsub_yolo/**/overlays/
 *.avi
 *.mkv
 *.mov
+
+# Keep this specific base dataset in git (as requested)
+!segmentation_bgsub_yolo/dataset/
+!segmentation_bgsub_yolo/dataset/**
