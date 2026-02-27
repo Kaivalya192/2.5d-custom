@@ -43,3 +43,5 @@ segmentation_bgsub_yolo/**/overlays/
 # Keep this specific base dataset in git (as requested)
 !segmentation_bgsub_yolo/dataset/
 !segmentation_bgsub_yolo/dataset/**
+!segmentation_bgsub_yolo/captured/
+!segmentation_bgsub_yolo/captured/**
