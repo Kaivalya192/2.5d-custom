@@ -45,3 +45,9 @@ segmentation_bgsub_yolo/**/overlays/
 !segmentation_bgsub_yolo/dataset/**
 !segmentation_bgsub_yolo/captured/
 !segmentation_bgsub_yolo/captured/**
+
+# Keep imported YOLO model folder in git (as requested)
+!runs/
+!runs/segment/
+!runs/segment/Imported/
+!runs/segment/Imported/**
