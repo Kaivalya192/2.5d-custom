@@ -1,0 +1,18 @@
+%YAML:1.0
+---
+mode: polygon4
+x: 157
+y: 148
+w: 918
+h: 511
+points: !!opencv-matrix
+   rows: 4
+   cols: 2
+   dt: i
+   data: [ 342, 165, 157, 657, 1075, 659, 884, 148 ]
+image_width: 1280
+image_height: 720
+x_norm: 0.12265624999999999
+y_norm: 0.20555555555555555
+w_norm: 0.71718749999999998
+h_norm: 0.70972222222222225

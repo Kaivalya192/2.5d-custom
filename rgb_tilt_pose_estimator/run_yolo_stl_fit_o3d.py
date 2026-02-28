@@ -40,6 +40,31 @@ def configure_realsense(profile, exposure: float, gain: float, wb: float, auto_e
         color_sensor.set_option(rs.option.white_balance, float(wb))
 
 
+def color_from_index(i: int) -> np.ndarray:
+    hue = float((int(i) * 57) % 360) / 360.0
+    s = 0.95
+    v = 1.0
+    h6 = hue * 6.0
+    k = int(np.floor(h6)) % 6
+    f = h6 - np.floor(h6)
+    p = v * (1.0 - s)
+    q = v * (1.0 - s * f)
+    t = v * (1.0 - s * (1.0 - f))
+    if k == 0:
+        rgb = np.array([v, t, p], dtype=np.float32)
+    elif k == 1:
+        rgb = np.array([q, v, p], dtype=np.float32)
+    elif k == 2:
+        rgb = np.array([p, v, t], dtype=np.float32)
+    elif k == 3:
+        rgb = np.array([p, q, v], dtype=np.float32)
+    elif k == 4:
+        rgb = np.array([t, p, v], dtype=np.float32)
+    else:
+        rgb = np.array([v, p, q], dtype=np.float32)
+    return rgb
+
+
 def mask_to_points(
     mask_full: np.ndarray,
     depth_u16: np.ndarray,
@@ -82,6 +107,29 @@ def to_o3d_pcd(pts: np.ndarray, cols: Optional[np.ndarray] = None) -> "o3d.geome
     if cols is not None and cols.shape[0] == pts.shape[0]:
         p.colors = o3d.utility.Vector3dVector(cols.astype(np.float64))
     return p
+
+
+def yolo_mask_roi(pred, idx: int, roi_h: int, roi_w: int) -> Optional[np.ndarray]:
+    if pred.masks is None:
+        return None
+    try:
+        mdata = pred.masks.data
+        if mdata is not None and int(mdata.shape[0]) > idx:
+            m = mdata[idx].detach().cpu().numpy().astype(np.float32)
+            if m.shape[0] != roi_h or m.shape[1] != roi_w:
+                m = cv2.resize(m, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
+            mu8 = (m > 0.5).astype(np.uint8) * 255
+            # Mild close to remove jagged tiny holes from mask upsampling.
+            ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mu8 = cv2.morphologyEx(mu8, cv2.MORPH_CLOSE, ker)
+            return mu8
+    except Exception:
+        pass
+    if pred.masks.xy is not None and len(pred.masks.xy) > idx:
+        poly = pred.masks.xy[idx]
+        if poly is not None and len(poly) >= 3:
+            return make_mask_from_polygon(poly, roi_h, roi_w)
+    return None
 
 
 def preprocess_for_reg(pcd: "o3d.geometry.PointCloud", voxel: float):
@@ -190,6 +238,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overlap_thr", type=float, default=0.65)
     p.add_argument("--top_overlap_thr", type=float, default=0.35)
     p.add_argument("--min_visible_ratio", type=float, default=0.55)
+    p.add_argument("--prefilter_conf", type=float, default=0.45)
+    p.add_argument("--prefilter_min_area", type=int, default=220)
+    p.add_argument("--prefilter_max_area_ratio", type=float, default=0.30)
+    p.add_argument("--prefilter_min_circularity", type=float, default=0.45)
+    p.add_argument("--prefilter_min_solidity", type=float, default=0.80)
+    p.add_argument("--prefilter_min_depth_valid_ratio", type=float, default=0.70)
+    p.add_argument("--prefilter_min_depth_relief_mm", type=float, default=1.0)
     p.add_argument("--mask_dilate_px", type=int, default=0)
     p.add_argument("--z_min", type=float, default=0.10)
     p.add_argument("--z_max", type=float, default=1.00)
@@ -198,7 +253,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--icp_dist", type=float, default=0.009)
     p.add_argument("--pc_point_size", type=float, default=2.5)
     p.add_argument("--pc_bg_dark", action="store_true")
-    p.add_argument("--show_full_cloud", action="store_true")
+    p.add_argument("--hide_full_cloud", action="store_true")
     p.add_argument("--show_mesh_fit", action="store_true")
     p.add_argument("--vector_len", type=float, default=0.03, help="axis vector length in meters")
     p.add_argument("--vector_radius", type=float, default=0.0035, help="arrow shaft radius in meters")
@@ -292,10 +347,12 @@ def select_top_visible_candidates(
     for c in cands:
         c["z_med"] = median_depth_in_mask(depth_u16, c["mask_full"], depth_scale, z_min, z_max)
     cands = [c for c in cands if np.isfinite(c["z_med"])]
-    cands.sort(key=lambda z: (z["z_med"], -z["confidence"], -z["area"]))
+    # First keep near/top-layer by depth.
+    cands.sort(key=lambda z: (z["z_med"], -z["area"], -z["confidence"]))
 
     selected: List[dict] = []
     occ_union = np.zeros_like(depth_u16, dtype=np.uint8)
+    passed: List[dict] = []
     for c in cands:
         m = c["mask_full"]
         a = int(max(1, c["area"]))
@@ -308,11 +365,46 @@ def select_top_visible_candidates(
             continue
         if vis_ratio < float(min_visible_ratio):
             continue
-        selected.append(c)
+        passed.append(c)
         occ_union = cv2.bitwise_or(occ_union, m)
-        if len(selected) >= int(max_instances):
-            break
+    # Among top-layer passed regions, prioritize larger areas for top-N.
+    passed.sort(key=lambda z: (-z["area"], z["z_med"], -z["confidence"]))
+    selected = passed[: int(max_instances)]
     return selected
+
+
+def contour_metrics_from_mask(mask_u8: np.ndarray) -> Tuple[float, float]:
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0, 0.0
+    c = max(contours, key=cv2.contourArea)
+    area = float(max(1.0, cv2.contourArea(c)))
+    peri = float(max(1e-6, cv2.arcLength(c, True)))
+    circularity = float((4.0 * np.pi * area) / (peri * peri))
+    hull = cv2.convexHull(c)
+    hull_area = float(max(1e-6, cv2.contourArea(hull)))
+    solidity = float(area / hull_area)
+    return circularity, solidity
+
+
+def depth_quality_metrics(
+    depth_u16: np.ndarray,
+    mask_u8: np.ndarray,
+    depth_scale: float,
+    z_min: float,
+    z_max: float,
+) -> Tuple[float, float]:
+    vals = depth_u16[mask_u8 > 0].astype(np.float32)
+    if vals.size == 0:
+        return 0.0, 0.0
+    z = vals * float(depth_scale)
+    valid = (z > 0.0) & (z >= float(z_min)) & (z <= float(z_max))
+    vr = float(np.count_nonzero(valid)) / float(max(1, z.size))
+    if np.count_nonzero(valid) < 8:
+        return vr, 0.0
+    zv = z[valid]
+    z_relief = float(np.percentile(zv, 90.0) - np.percentile(zv, 10.0))
+    return vr, z_relief
 
 
 def rot_from_z_to_vec(v: np.ndarray) -> np.ndarray:
@@ -473,18 +565,24 @@ def main() -> None:
     fit_meshes: List[o3d.geometry.TriangleMesh] = []
     for _ in range(int(max(1, args.max_fit_instances))):
         fit_meshes.append(o3d.geometry.TriangleMesh(mesh))
-    if bool(args.show_full_cloud):
-        vis.add_geometry(full_cloud)
+    show_full = not bool(args.hide_full_cloud)
+    vis.add_geometry(full_cloud)
     vis.add_geometry(seg_cloud)
     if bool(args.show_mesh_fit):
         for gm in fit_meshes:
             vis.add_geometry(gm)
     vector_shafts: List[o3d.geometry.TriangleMesh] = []
+    tip_spheres: List[o3d.geometry.TriangleMesh] = []
     for _ in range(int(max(1, args.max_fit_instances))):
         sh = make_vector_cylinder(float(args.vector_radius))
+        sp = o3d.geometry.TriangleMesh.create_sphere(radius=max(0.0008, float(args.vector_radius) * 0.8), resolution=12)
+        sp.compute_vertex_normals()
         hide_mesh_far(sh)
+        hide_mesh_far(sp)
         vector_shafts.append(sh)
+        tip_spheres.append(sp)
         vis.add_geometry(sh)
+        vis.add_geometry(sp)
     ropt = vis.get_render_option()
     if ropt is not None:
         ropt.point_size = float(max(1.0, args.pc_point_size))
@@ -516,15 +614,13 @@ def main() -> None:
                 source=roi, conf=float(args.conf), iou=float(args.iou), imgsz=int(args.imgsz), max_det=int(args.max_det), verbose=False
             )[0]
             cands = []
-            if pred.masks is not None and pred.boxes is not None and len(pred.masks.xy) > 0:
-                polys = pred.masks.xy
+            if pred.masks is not None and pred.boxes is not None and len(pred.boxes) > 0:
                 boxes = pred.boxes
-                n = min(len(polys), len(boxes))
+                n = len(boxes)
                 for i in range(n):
-                    poly = polys[i]
-                    if poly is None or len(poly) < 3:
+                    m = yolo_mask_roi(pred, i, roi.shape[0], roi.shape[1])
+                    if m is None:
                         continue
-                    m = make_mask_from_polygon(poly, roi.shape[0], roi.shape[1])
                     area = int(np.count_nonzero(m))
                     if area < 120:
                         continue
@@ -538,7 +634,39 @@ def main() -> None:
                     mf[y0:y1, x0:x1] = mm
                     cands.append({"mask": m, "mask_full": mf, "area": int(np.count_nonzero(mf)), "confidence": conf})
             cands = suppress_overlaps(cands, float(args.overlap_thr))
-            cands.sort(key=lambda z: (z["confidence"], z["area"]), reverse=True)
+            # Robust prefilter: remove likely background false positives.
+            roi_area = float(max(1, (x1 - x0) * (y1 - y0)))
+            filtered: List[dict] = []
+            for cand in cands:
+                if float(cand["confidence"]) < float(args.prefilter_conf):
+                    continue
+                if int(cand["area"]) < int(args.prefilter_min_area):
+                    continue
+                if float(cand["area"]) > float(args.prefilter_max_area_ratio) * roi_area:
+                    continue
+                circ, solid = contour_metrics_from_mask(cand["mask"].astype(np.uint8))
+                if circ < float(args.prefilter_min_circularity):
+                    continue
+                if solid < float(args.prefilter_min_solidity):
+                    continue
+                vr, relief_m = depth_quality_metrics(
+                    depth_u16=depth_u16,
+                    mask_u8=cand["mask_full"],
+                    depth_scale=depth_scale,
+                    z_min=float(args.z_min),
+                    z_max=float(args.z_max),
+                )
+                if vr < float(args.prefilter_min_depth_valid_ratio):
+                    continue
+                if (relief_m * 1000.0) < float(args.prefilter_min_depth_relief_mm):
+                    continue
+                cand["circularity"] = float(circ)
+                cand["solidity"] = float(solid)
+                cand["depth_valid_ratio"] = float(vr)
+                cand["depth_relief_mm"] = float(relief_m * 1000.0)
+                filtered.append(cand)
+            cands = filtered
+            cands.sort(key=lambda z: (z["area"], z["confidence"]), reverse=True)
 
             mask_full = np.zeros((h, w), dtype=np.uint8)
             selected = select_top_visible_candidates(
@@ -554,32 +682,59 @@ def main() -> None:
             for c in selected:
                 mask_full = cv2.bitwise_or(mask_full, c["mask_full"])
 
-            all_pts = np.zeros((0, 3), dtype=np.float32)
-            all_cols = np.zeros((0, 3), dtype=np.float32)
-            if bool(args.show_full_cloud):
-                all_mask = np.ones((h, w), dtype=np.uint8) * 255
+            all_mask = np.ones((h, w), dtype=np.uint8) * 255
+            all_pts, all_cols = mask_to_points(
+                all_mask, depth_u16, color, fx, fy, cx, cy, depth_scale, float(args.z_min), float(args.z_max), stride=2
+            )
+            if all_pts.shape[0] < 150:
+                # Fallback: at least show ROI cloud when full-frame valid points are sparse.
+                roi_mask_full = np.zeros((h, w), dtype=np.uint8)
+                roi_mask_full[y0:y1, x0:x1] = 255
                 all_pts, all_cols = mask_to_points(
-                    all_mask, depth_u16, color, fx, fy, cx, cy, depth_scale, float(args.z_min), float(args.z_max), stride=2
+                    roi_mask_full, depth_u16, color, fx, fy, cx, cy, depth_scale, float(args.z_min), float(args.z_max), stride=1
                 )
-                if all_pts.shape[0] < 150:
-                    # Fallback: at least show ROI cloud when full-frame valid points are sparse.
-                    roi_mask_full = np.zeros((h, w), dtype=np.uint8)
-                    roi_mask_full[y0:y1, x0:x1] = 255
-                    all_pts, all_cols = mask_to_points(
-                        roi_mask_full, depth_u16, color, fx, fy, cx, cy, depth_scale, float(args.z_min), float(args.z_max), stride=1
-                    )
             seg_pts, seg_cols = mask_to_points(
                 mask_full, depth_u16, color, fx, fy, cx, cy, depth_scale, float(args.z_min), float(args.z_max), stride=max(1, int(args.cloud_stride))
             )
 
-            if bool(args.show_full_cloud):
+            if show_full:
                 full_cloud.points = o3d.utility.Vector3dVector(all_pts.astype(np.float64))
                 full_cloud.colors = o3d.utility.Vector3dVector(all_cols.astype(np.float64))
+            else:
+                full_cloud.points = o3d.utility.Vector3dVector(np.zeros((0, 3), dtype=np.float64))
+                full_cloud.colors = o3d.utility.Vector3dVector(np.zeros((0, 3), dtype=np.float64))
 
+            # Per-instance segmented colors for clarity.
+            seg_pts_all: List[np.ndarray] = []
+            seg_cols_all: List[np.ndarray] = []
+            for i, c in enumerate(selected[: int(args.max_fit_instances)]):
+                ipts, _ = mask_to_points(
+                    c["mask_full"],
+                    depth_u16,
+                    color,
+                    fx,
+                    fy,
+                    cx,
+                    cy,
+                    depth_scale,
+                    float(args.z_min),
+                    float(args.z_max),
+                    stride=max(1, int(args.cloud_stride)),
+                )
+                if ipts.shape[0] == 0:
+                    continue
+                col = color_from_index(i + 1).reshape(1, 3)
+                icol = np.repeat(col, ipts.shape[0], axis=0).astype(np.float32)
+                seg_pts_all.append(ipts.astype(np.float32))
+                seg_cols_all.append(icol)
+            if seg_pts_all:
+                seg_pts = np.concatenate(seg_pts_all, axis=0)
+                seg_cols = np.concatenate(seg_cols_all, axis=0)
+            else:
+                seg_pts = np.zeros((0, 3), dtype=np.float32)
+                seg_cols = np.zeros((0, 3), dtype=np.float32)
             seg_cloud.points = o3d.utility.Vector3dVector(seg_pts.astype(np.float64))
-            if seg_cols.shape[0] == seg_pts.shape[0]:
-                bright = np.clip(seg_cols * np.array([0.6, 1.0, 0.6], dtype=np.float32), 0.0, 1.0)
-                seg_cloud.colors = o3d.utility.Vector3dVector(bright.astype(np.float64))
+            seg_cloud.colors = o3d.utility.Vector3dVector(seg_cols.astype(np.float64))
 
             pose_lines: List[str] = []
             valid_fit_count = 0
@@ -606,6 +761,7 @@ def main() -> None:
                     gm.paint_uniform_color([0.3, 0.3, 0.3])
                     gm.translate((0.0, 0.0, -8.0), relative=False)
                     hide_mesh_far(vector_shafts[i])
+                    hide_mesh_far(tip_spheres[i])
                     continue
                 tgt_pcd = to_o3d_pcd(obj_pts, None)
                 T, ok, fitness, rmse = register_mesh_to_segment(
@@ -637,11 +793,14 @@ def main() -> None:
                 p1 = (center_w + axis_w * float(args.vector_len)).astype(np.float64)
                 if ok:
                     set_vector_cylinder(vector_shafts[i], p0, p1, (0.1, 1.0, 0.1), float(args.vector_radius))
+                    tip_spheres[i].translate(tuple(p1.tolist()), relative=False)
+                    tip_spheres[i].paint_uniform_color([0.1, 1.0, 0.1])
                     pose_lines.append(
                         f"#{i+1} z={c['z_med']:.3f} vis={c['visible_ratio']:.2f} fit={fitness:.2f} rmse={rmse*1000.0:.1f} x={center_w[0]:+.3f} y={center_w[1]:+.3f} z={center_w[2]:+.3f} r={r_deg:+.1f} p={p_deg:+.1f}"
                     )
                 else:
                     hide_mesh_far(vector_shafts[i])
+                    hide_mesh_far(tip_spheres[i])
 
             for j in range(len(selected), int(args.max_fit_instances)):
                 gm = fit_meshes[j]
@@ -652,15 +811,17 @@ def main() -> None:
                 gm.paint_uniform_color([0.3, 0.3, 0.3])
                 gm.translate((0.0, 0.0, -8.0), relative=False)
                 hide_mesh_far(vector_shafts[j])
+                hide_mesh_far(tip_spheres[j])
 
-            if bool(args.show_full_cloud):
-                vis.update_geometry(full_cloud)
+            vis.update_geometry(full_cloud)
             vis.update_geometry(seg_cloud)
             if bool(args.show_mesh_fit):
                 for gm in fit_meshes:
                     vis.update_geometry(gm)
             for sh in vector_shafts:
                 vis.update_geometry(sh)
+            for sp in tip_spheres:
+                vis.update_geometry(sp)
             if not view_inited:
                 ctr = vis.get_view_control()
                 if ctr is not None:

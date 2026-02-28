@@ -1,0 +1,7 @@
+path: C:\Users\asus\dexsent\test\2.5d-custom\segmentation_two_side_yolo\dataset
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: front
+  1: back
