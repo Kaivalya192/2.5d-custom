@@ -37,6 +37,14 @@ def _oak_sensor_resolution(name: str):
     return sr.THE_1080_P
 
 
+def _oak_xlink_nodes():
+    if hasattr(dai.node, "XLinkOut") and hasattr(dai.node, "XLinkIn"):
+        return dai.node.XLinkOut, dai.node.XLinkIn
+    if hasattr(dai.node, "internal") and hasattr(dai.node.internal, "XLinkOut") and hasattr(dai.node.internal, "XLinkIn"):
+        return dai.node.internal.XLinkOut, dai.node.internal.XLinkIn
+    raise RuntimeError("DepthAI build does not expose XLinkOut/XLinkIn nodes.")
+
+
 def source_oak(
     width: int,
     height: int,
@@ -55,8 +63,9 @@ def source_oak(
 
     pipeline = dai.Pipeline()
     cam = pipeline.create(dai.node.ColorCamera)
-    xout = pipeline.create(dai.node.XLinkOut)
-    xin = pipeline.create(dai.node.XLinkIn)
+    xout_node, xin_node = _oak_xlink_nodes()
+    xout = pipeline.create(xout_node)
+    xin = pipeline.create(xin_node)
     xout.setStreamName("rgb")
     xin.setStreamName("control")
 
@@ -92,4 +101,3 @@ def source_oak(
             frame = pkt.getCvFrame()
             if frame is not None and frame.size > 0:
                 yield frame
-
